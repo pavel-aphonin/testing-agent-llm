@@ -1,0 +1,21 @@
+# GGUF model files (downloaded via seed script, never committed)
+models/
+*.gguf
+*.bin
+
+# llama.cpp build
+llama.cpp/
+build/
+
+# llama-swap runtime config (generated from DB)
+llama-swap.yaml
+
+# Env
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
