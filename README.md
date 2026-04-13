@@ -1,69 +1,134 @@
 # testing-agent-llm
 
-LLM inference microservice for Testing Agent. Runs [llama-swap](https://github.com/mostlygeek/llama-swap) in front of [llama.cpp](https://github.com/ggml-org/llama.cpp) to serve multiple GGUF models on a single OpenAI-compatible endpoint.
+LLM inference microservice for Testing Agent. Runs
+[llama-swap](https://github.com/mostlygeek/llama-swap) in front of
+[llama.cpp](https://github.com/ggml-org/llama.cpp) so a single
+OpenAI-compatible endpoint can serve many GGUF models on demand.
 
-Admin uploads models through the backend UI; this container loads them on demand.
+Testers pick a model per run from the frontend; this container lazy-loads
+the chosen model into llama-server, serves the request, and unloads after
+the idle TTL expires.
 
 ## Why llama-swap
 
-A single `llama-server` process can only hold one model in memory at a time. We want admin to manage a model registry (Gemma 4 E4B, Qwen3.5-35B-A3B, etc.) and testers to pick one per run. llama-swap solves this by:
+A single `llama-server` process holds exactly one model in memory. We
+want an admin-managed registry (Gemma 4 E4B, Qwen 3.5 35B-A3B, and
+whatever the admin downloads through the HF browser) with per-run
+selection by testers. llama-swap gives us that:
 
-1. Proxying OpenAI-compatible requests
-2. Routing to the right `llama-server` instance by `model` field in the request
-3. Auto-starting llama-server processes when needed
-4. Releasing GPU/RAM when idle
+1. OpenAI-compatible proxy on a single port
+2. Routes each request to the right llama-server instance by the
+   `model` field in the request body
+3. Auto-spawns llama-server processes on demand
+4. Releases GPU/RAM after a configurable idle timeout (10 minutes by
+   default, see `DEFAULT_TTL_SECONDS` in `testing-agent-backend/app/llm_swap.py`)
+5. `-watch-config` — reloads the YAML without a container restart
 
 ## Seed models
 
-On first startup, the backend's seed script downloads two models into the shared volume:
+Two models ship with the stack and are pre-registered by the backend
+on first startup. The GGUF files themselves are **not** baked into the
+image — the admin runs `make download-models` from
+`testing-agent-infra/` once, which writes them into the shared
+bind-mount.
 
-| Model | Size | Use case |
+| Model | Size | Role |
 |---|---|---|
-| Gemma 4 E4B (Q4_K_M) | ~2.5 GB | Fast classifier, PUCT priors, MC fallback |
-| Qwen3.5-35B-A3B (Q4_K_XL) | ~20 GB | AI-only mode, complex reasoning, vision fallback |
+| Gemma 4 E4B (Q4_K_M + F16 mmproj) | ~5 GB + 1 GB | Fast classifier in Hybrid mode, sets PUCT priors over UI elements |
+| Qwen 3.5 35B-A3B (UD-Q4_K_XL + F16 mmproj) | ~22 GB + 2 GB | Smart actor in AI mode, Phase 2 graph review, reasoning |
 
-Both are multimodal (text + vision via separate mmproj files).
+Both models are multimodal (text + vision via a separate mmproj file)
+and released April 7, 2026. Qwen 3.5 35B-A3B is a Mixture-of-Experts
+model with only 3B active parameters per token, so inference speed is
+closer to a dense 3B model than to its 35B total parameter count.
 
-Admin can add more models through `/admin/models` in the frontend.
+After the bootstrap, admins can add more models any time from
+`/admin/models` in the frontend — either by registering a GGUF that
+already sits in the volume or by clicking **Browse HuggingFace** to
+search HF, pick a file, and stream the download with a live progress
+bar.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│  Backend                                     │
-│  │                                           │
-│  ▼                                           │
-│  llama-swap  :8080  (OpenAI-compatible)      │
-│  │                                           │
-│  ├─► llama-server  :8180  gemma-4-e4b        │
-│  ├─► llama-server  :8181  qwen3.5-35b-a3b    │
-│  └─► llama-server  :818N  <user model>       │
-└─────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│  Backend (FastAPI)                                  │
+│    writes llama-swap.yaml after every              │
+│    admin CRUD on llm_models                        │
+└──────────────────────────┬──────────────────────────┘
+                           │
+                ┌──────────▼───────────────────┐
+                │ shared bind-mount             │
+                │   GGUF files                  │
+                │   mmproj files                │
+                │   llama-swap.yaml              │
+                └──────────┬───────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────┐
+│  testing-agent-llm container                        │
+│    llama-swap -config ... -watch-config  :8080     │
+│      ├─► llama-server :8180  gemma-4-e4b           │
+│      ├─► llama-server :8181  qwen3.5-35b-a3b       │
+│      └─► llama-server :818N  <admin-added model>   │
+└─────────────────────────────────────────────────────┘
 ```
 
-`llama-swap.yaml` is generated dynamically by the backend from the `llm_models` Postgres table whenever admin activates/deactivates a model. The container reloads on change.
+The backend is the single source of truth for what models exist. It
+regenerates `llama-swap.yaml` atomically (tmp file + `os.replace`) so
+llama-swap's inotify watcher picks up exactly one reload per change.
 
 ## Volume layout
 
-```
-/var/lib/llm/
-├── models/
-│   ├── gemma-4-e4b-Q4_K_M.gguf
-│   ├── mmproj-gemma-4-e4b.gguf
-│   ├── Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
-│   └── mmproj-Qwen3.5-35B-A3B-F16.gguf
-└── llama-swap.yaml
-```
+`LLM_MODELS_DIR` (from `.env` in `testing-agent-infra`) is mounted into
+both the `backend` and `llm` containers at `/var/lib/llm-models`:
 
-Mounted into both this container (read-only, for serving) and backend (read-write, for upload + yaml generation).
+```
+/var/lib/llm-models/
+├── gemma-4-E4B-it-Q4_K_M.gguf
+├── gemma-4-E4B-it-mmproj-F16.gguf
+├── Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+├── Qwen3.5-35B-A3B-mmproj-F16.gguf
+└── llama-swap.yaml          ← generated by backend
+```
 
 ## Hardware
 
-Targets macOS with Apple Silicon (Metal). On M2 Max 96GB both seed models fit in RAM simultaneously → instant switching. Linux + NVIDIA GPU also supported through llama.cpp CUDA build.
+The compose service is gated behind the `full` profile
+(`docker compose --profile full up llm`) because Docker Desktop on
+macOS runs containers through virtualization and has no access to
+Apple Silicon Metal. On a Mac M2/M3 the container runs CPU-only
+llama.cpp, which is unusably slow for a 35B MoE.
+
+Production targets are Linux + NVIDIA GPU (CUDA build of llama.cpp)
+and stays Docker-native.
+
+For development on macOS, run llama.cpp natively on the host instead:
+
+```bash
+brew install llama.cpp
+# then in testing-agent-llm run llama-swap against the same config
+/opt/homebrew/opt/llama.cpp/bin/llama-server -m ... # or use llama-swap directly
+```
+
+…and set `LLM_BASE_URL=http://host.docker.internal:8080` in the
+backend `.env`.
+
+## Image build
+
+```
+docker compose --profile full build llm
+```
+
+The Dockerfile starts from `ghcr.io/ggml-org/llama.cpp:server` (which
+already has `llama-server` on PATH plus every runtime lib llama.cpp
+needs) and layers the static `llama-swap` binary on top. The binary
+URL is built from `ARG LLAMA_SWAP_VERSION` + `ARG TARGETARCH` so
+BuildKit produces a matching binary for whatever platform the image
+is built for (arm64 native on M-series, amd64 in CI and Linux prod).
 
 ## Related repos
 
-- `testing-agent-backend` — writes `llama-swap.yaml`
-- `testing-agent-explorer` — sends inference requests via OpenAI-compatible API
-- `testing-agent-frontend` — admin model management UI
-- `testing-agent-infra` — docker-compose stack
+- `testing-agent-backend` — writes `llama-swap.yaml`, serves HF browser endpoints
+- `testing-agent-explorer` — sends inference requests via the OpenAI-compatible API
+- `testing-agent-frontend` — admin model management UI, including HF browser modal
+- `testing-agent-infra` — docker-compose stack + `make download-models` bootstrap
