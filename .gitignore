@@ -19,3 +19,4 @@ llama-swap.yaml
 
 # Logs
 *.log
+.idea/
